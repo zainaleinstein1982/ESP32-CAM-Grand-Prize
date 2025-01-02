@@ -1,73 +1,95 @@
-#include <esp_camera.h>
-#include <WiFi.h>
+import cv2
+import numpy as np
+import os
+import tensorflow as tf
 
-// Replace with your network credentials
-const char* ssid = "Your_SSID";
-const char* password = "Your_PASSWORD";
+# Define paths
+CT_IMAGES_DIR = "./ct_images"
+MODELS_DIR = "./models"
+OUTPUT_DIR = "./output"
+SEGMENTATION_MODEL = os.path.join(MODELS_DIR, "segmentation_model.tflite")
 
-void startCameraServer();
+os.makedirs(OUTPUT_DIR, exist_ok=True)
 
-void setup() {
-  Serial.begin(115200);
-  Serial.println();
-  Serial.println("Booting ESP32-CAM...");
+# 1. Load CT Images
+def load_ct_images(ct_images_dir):
+    images = []
+    for filename in sorted(os.listdir(ct_images_dir)):
+        if filename.endswith(".png") or filename.endswith(".jpg"):
+            filepath = os.path.join(ct_images_dir, filename)
+            img = cv2.imread(filepath, cv2.IMREAD_GRAYSCALE)
+            images.append(img)
+    return np.array(images)
 
-  // Initialize camera
-  camera_config_t config;
-  config.ledc_channel = LEDC_CHANNEL_0;
-  config.ledc_timer = LEDC_TIMER_0;
-  config.pin_d0 = Y2_GPIO_NUM;
-  config.pin_d1 = Y3_GPIO_NUM;
-  config.pin_d2 = Y4_GPIO_NUM;
-  config.pin_d3 = Y5_GPIO_NUM;
-  config.pin_d4 = Y6_GPIO_NUM;
-  config.pin_d5 = Y7_GPIO_NUM;
-  config.pin_d6 = Y8_GPIO_NUM;
-  config.pin_d7 = Y9_GPIO_NUM;
-  config.pin_xclk = XCLK_GPIO_NUM;
-  config.pin_pclk = PCLK_GPIO_NUM;
-  config.pin_vsync = VSYNC_GPIO_NUM;
-  config.pin_href = HREF_GPIO_NUM;
-  config.pin_sscb_sda = SIOD_GPIO_NUM;
-  config.pin_sscb_scl = SIOC_GPIO_NUM;
-  config.pin_pwdn = PWDN_GPIO_NUM;
-  config.pin_reset = RESET_GPIO_NUM;
-  config.pin_xclk = XCLK_GPIO_NUM;
-  config.xclk_freq_hz = 20000000;
-  config.pixel_format = PIXFORMAT_JPEG;
+# 2. Segment Papyrus
+def segment_image(image, model_path):
+    model = tf.lite.Interpreter(model_path=model_path)
+    model.allocate_tensors()
+    input_details = model.get_input_details()
+    output_details = model.get_output_details()
 
-  if (psramFound()) {
-    config.frame_size = FRAMESIZE_UXGA;
-    config.jpeg_quality = 10;
-    config.fb_count = 2;
-  } else {
-    config.frame_size = FRAMESIZE_SVGA;
-    config.jpeg_quality = 12;
-    config.fb_count = 1;
-  }
+    # Preprocess image
+    input_data = cv2.resize(image, (128, 128)).astype('float32') / 255.0
+    input_data = np.expand_dims(input_data, axis=0)
 
-  // Initialize camera
-  esp_err_t err = esp_camera_init(&config);
-  if (err != ESP_OK) {
-    Serial.printf("Camera init failed with error 0x%x\n", err);
-    return;
-  }
+    # Run inference
+    model.set_tensor(input_details[0]['index'], input_data)
+    model.invoke()
 
-  // Connect to Wi-Fi
-  WiFi.begin(ssid, password);
-  while (WiFi.status() != WL_CONNECTED) {
-    delay(500);
-    Serial.print(".");
-  }
-  Serial.println("WiFi connected");
-  Serial.print("IP address: ");
-  Serial.println(WiFi.localIP());
+    output_data = model.get_tensor(output_details[0]['index'])
+    segmented_mask = (output_data[0] > 0.5).astype('uint8') * 255
+    return segmented_mask
 
-  // Start camera server
-  startCameraServer();
-  Serial.println("Camera server started");
-}
+# 3. Detect Ink
+def detect_ink(segmented_image):
+    ink_mask = cv2.adaptiveThreshold(segmented_image, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+                                     cv2.THRESH_BINARY_INV, 11, 2)
+    return ink_mask
 
-void loop() {
-  // The ESP32 will handle incoming camera requests automatically
-}
+# 4. Add Scale Bar
+def add_scale_bar(image, scale_length=100, pixels_per_cm=10):
+    image_with_scale = image.copy()
+    height, width = image_with_scale.shape
+
+    start_x = 50
+    start_y = height - 50
+    end_x = start_x + scale_length
+
+    cv2.line(image_with_scale, (start_x, start_y), (end_x, start_y), (255, 255, 255), 2)
+    cv2.putText(image_with_scale, "1 cm", (start_x + 10, start_y - 10),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+    return image_with_scale
+
+# 5. Save Outputs
+def save_outputs(flattened_image, ink_mask, output_dir):
+    cv2.imwrite(os.path.join(output_dir, "segmented_image.png"), flattened_image)
+    cv2.imwrite(os.path.join(output_dir, "ink_detected.png"), ink_mask)
+
+# Main Pipeline
+def main():
+    # Load CT Images
+    print("Loading CT images...")
+    ct_images = load_ct_images(CT_IMAGES_DIR)
+
+    # Segment Papyrus
+    print("Segmenting images...")
+    segmented_images = [segment_image(img, SEGMENTATION_MODEL) for img in ct_images]
+
+    # Combine all segmented images into a single flattened output
+    flattened_image = np.max(segmented_images, axis=0)
+
+    # Detect Ink
+    print("Detecting ink...")
+    ink_mask = detect_ink(flattened_image)
+
+    # Add Scale Bar
+    flattened_image_with_scale = add_scale_bar(flattened_image)
+    ink_mask_with_scale = add_scale_bar(ink_mask)
+
+    # Save Outputs
+    print("Saving outputs...")
+    save_outputs(flattened_image_with_scale, ink_mask_with_scale, OUTPUT_DIR)
+    print(f"Outputs saved to {OUTPUT_DIR}")
+
+if __name__ == "__main__":
+    main()
